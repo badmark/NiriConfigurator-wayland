@@ -241,7 +241,7 @@ class NiriConfigHandler:
     def replace_spawn_actions(self, new_actions):
         self.content = re.sub(r'^\s*(spawn-at-startup|spawn-sh-at-startup)\s+.*(\r\n|\r|\n)?', '', self.content, flags=re.MULTILINE)
         new_block = "\n"
-        for act in new_actions: new_block += f"{act['type']} \"{act['command']}\"\n"
+        for act in new_actions: new_block += f"    {act['type']} \"{act['command']}\"\n"
         self.content += new_block
 
     def extract_environment_vars(self):
@@ -259,6 +259,55 @@ class NiriConfigHandler:
         inner = ""
         for v in vars_list: inner += f"    {v['name']} \"{v['value']}\"\n"
         self.update_block("environment", inner)
+        
+    def extract_switch_events(self):
+        switches = []
+        # Usually inside 'input' block -> 'switch-events' block
+        # We try to extract input, then switch-events
+        in_res = self.extract_block_content(self.content, "input")
+        if in_res:
+            sw_res = self.extract_block_content(in_res[2], "switch-events")
+            if sw_res:
+                lines = sw_res[2].split('\n')
+                for line in lines:
+                    line = line.strip()
+                    if '{' in line and not line.startswith("//"):
+                        evt, act = line.split('{', 1)
+                        switches.append({'event': evt.strip(), 'action': act.strip(' }')})
+        return switches
+
+    def replace_switch_events(self, switches_data):
+        inner = ""
+        for s in switches_data:
+            inner += f"        {s['event']} {{ {s['action']} }}\n"
+        
+        # We need to construct the full input structure properly if updating
+        # For simplicity, we assume 'input' block exists, and we want to update/add 'switch-events' inside it.
+        # This is complex with regex. A safe approach is:
+        # 1. Extract 'input' block.
+        # 2. Extract 'switch-events' from that.
+        # 3. Replace 'switch-events' content or append it.
+        # 4. Replace 'input' block in main content.
+        
+        in_res = self.extract_block_content(self.content, "input")
+        if in_res:
+            s, e, in_content = in_res
+            sw_res = self.extract_block_content(in_content, "switch-events")
+            
+            new_sw_block = f"    switch-events {{\n{inner}    }}\n"
+            
+            if sw_res:
+                ss, se, _ = sw_res
+                # Reconstruct input block with new switch block
+                new_in_content = in_content[:ss] + f"switch-events {{\n{inner}    }}" + in_content[se+1:] # +1 for brace
+            else:
+                # Append to input
+                new_in_content = in_content + new_sw_block
+                
+            # Update main content
+            brace_pos = self.content.find('{', s)
+            header = self.content[s:brace_pos+1]
+            self.content = self.content[:s] + f"{header}{new_in_content}}}" + self.content[e:]
 
     def extract_includes(self):
         return [m.group(1) for m in re.finditer(r'^\s*include\s+"([^"]+)"', self.content, re.MULTILINE)]
@@ -429,8 +478,14 @@ class NiriWindow(QMainWindow):
         
         self.handler = NiriConfigHandler()
         self.widget_map = {}
+        self.outputs_data = []
+        self.binds_data = []
+        self.layer_rules_data = []
+        self.rules_data = []
+        self.spawn_data = []
+        self.env_data = []
+        self.switch_data = []
         
-        # System Info
         self.sys_outputs = SystemInfo.get_connected_outputs()
         self.sys_cursors = SystemInfo.get_installed_cursor_themes()
         self.sys_drm = SystemInfo.get_drm_devices()
@@ -667,6 +722,7 @@ class NiriWindow(QMainWindow):
     def create_binds_tab(self):
         split = QSplitter(Qt.Horizontal)
         self.bind_tree = QTreeWidget(); self.bind_tree.setHeaderLabels(["Key", "Action"])
+        self.bind_tree.itemSelectionChanged.connect(self.on_bind_select_ui)
         split.addWidget(self.bind_tree)
         
         w = QWidget(); l = QVBoxLayout(w)
@@ -704,6 +760,36 @@ class NiriWindow(QMainWindow):
                     self.bind_data.append((k, a))
                     QTreeWidgetItem(self.bind_tree, [k, a])
 
+    def on_bind_select_ui(self):
+        item = self.bind_tree.currentItem()
+        if not item: return
+        key = item.text(0)
+        action = item.text(1)
+        
+        # Reset modifiers
+        self.bn_mod.setChecked(False); self.bn_s.setChecked(False); self.bn_c.setChecked(False); self.bn_a.setChecked(False)
+        
+        parts = key.split("+")
+        final_k = ""
+        for p in parts:
+            if p == "Mod": self.bn_mod.setChecked(True)
+            elif p == "Shift": self.bn_s.setChecked(True)
+            elif p == "Ctrl": self.bn_c.setChecked(True)
+            elif p == "Alt": self.bn_a.setChecked(True)
+            else: final_k = p
+        
+        self.bn_key.setText(final_k)
+        
+        if action.startswith("spawn"):
+            self.bn_act.setCurrentText("")
+            # Extract spawn cmd
+            m = re.search(r'spawn\s+"([^"]+)"', action)
+            if m: self.bn_spawn.setText(m.group(1))
+            else: self.bn_spawn.setText(action.replace("spawn ", "").replace(";", "").strip('"'))
+        else:
+            self.bn_act.setCurrentText(action.replace(";", ""))
+            self.bn_spawn.setText("")
+
     def add_bind(self):
         mods = []
         if self.bn_mod.isChecked(): mods.append("Mod")
@@ -716,8 +802,17 @@ class NiriWindow(QMainWindow):
         if self.bn_spawn.text(): act = f'spawn "{self.bn_spawn.text()}"'
         if not act.endswith(';'): act += ";"
         
-        self.bind_data.append((k, act))
-        self.reload_binds_ui() # local reload
+        # Check if updating
+        exists = False
+        for i, (bk, ba) in enumerate(self.bind_data):
+            if bk == k:
+                self.bind_data[i] = (k, act)
+                exists = True
+                break
+        if not exists:
+            self.bind_data.append((k, act))
+            
+        self.reload_binds_ui()
 
     def reload_binds_ui(self):
         self.bind_tree.clear()
@@ -737,35 +832,98 @@ class NiriWindow(QMainWindow):
 
     def create_misc_tab(self):
         w = QWidget(); l = QFormLayout(w)
-        self.create_form_row(l, "Screenshot Path", "", "screenshot-path", "", is_file=True)
+        
+        # Screenshot Section
+        gb_scr = QGroupBox("Screenshot Settings")
+        l_scr = QFormLayout(gb_scr)
+        
+        self.ss_dir = QLineEdit()
+        btn_browse = QPushButton("📂")
+        btn_browse.clicked.connect(self.browse_ss_dir)
+        h_dir = QHBoxLayout(); h_dir.addWidget(self.ss_dir); h_dir.addWidget(btn_browse)
+        l_scr.addRow("Folder", h_dir)
+        
+        self.ss_file = QLineEdit()
+        self.ss_vars = QComboBox()
+        self.ss_vars.addItems(["Insert Variable...", "%Y (Year)", "%m (Month)", "%d (Day)", "%H (Hour)", "%M (Min)", "%S (Sec)"])
+        self.ss_vars.activated.connect(self.insert_ss_var)
+        l_scr.addRow("Filename", self.ss_file)
+        l_scr.addRow("", self.ss_vars)
+        
+        l.addRow(gb_scr)
+
         self.create_form_row(l, "No CSD", "", "prefer-no-csd", "false", is_bool=True)
         
         # Spawns
         self.spawn_tree = QTreeWidget(); self.spawn_tree.setHeaderLabels(["Type", "Command"])
+        self.spawn_tree.itemSelectionChanged.connect(self.on_spawn_select_ui)
         l.addRow("Startups:", self.spawn_tree)
+        
         self.sp_type = QComboBox(); self.sp_type.addItems(["spawn-at-startup", "spawn-sh-at-startup"])
         self.sp_cmd = QLineEdit()
         l.addRow(self.sp_type, self.sp_cmd)
-        btn = QPushButton("Add Spawn"); btn.clicked.connect(self.add_spawn); l.addRow(btn)
-        btn_d = QPushButton("Del Spawn"); btn_d.clicked.connect(self.del_spawn); l.addRow(btn_d)
+        
+        btn_box = QHBoxLayout()
+        btn_add = QPushButton("Add"); btn_add.clicked.connect(self.add_spawn)
+        btn_upd = QPushButton("Update"); btn_upd.clicked.connect(self.update_spawn)
+        btn_del = QPushButton("Delete"); btn_del.clicked.connect(self.del_spawn)
+        btn_box.addWidget(btn_add); btn_box.addWidget(btn_upd); btn_box.addWidget(btn_del)
+        l.addRow(btn_box)
         
         self.add_tab(w, "Misc")
         self.reload_spawns()
+        self.reload_screenshot_ui()
+
+    def browse_ss_dir(self):
+        d = QFileDialog.getExistingDirectory(self, "Select Screenshot Directory")
+        if d: self.ss_dir.setText(d)
+
+    def insert_ss_var(self, index):
+        if index > 0:
+            var = self.ss_vars.currentText().split(" ")[0]
+            self.ss_file.insert(var)
+            self.ss_vars.setCurrentIndex(0)
+
+    def reload_screenshot_ui(self):
+        full = self.handler.get_value("", "screenshot-path", "")
+        if full:
+            full = full.strip('"')
+            d, f = os.path.split(full)
+            self.ss_dir.setText(d)
+            self.ss_file.setText(f)
+
+    def save_screenshot_to_handler(self):
+        if self.ss_dir.text() and self.ss_file.text():
+            full = os.path.join(self.ss_dir.text(), self.ss_file.text())
+            self.handler.set_value("", "screenshot-path", full, True)
 
     def reload_spawns(self):
         self.spawn_tree.clear()
         self.spawn_data = self.handler.extract_spawn_actions()
         for s in self.spawn_data: QTreeWidgetItem(self.spawn_tree, [s['type'], s['command']])
 
+    def on_spawn_select_ui(self):
+        item = self.spawn_tree.currentItem()
+        if not item: return
+        self.sp_type.setCurrentText(item.text(0))
+        self.sp_cmd.setText(item.text(1))
+
     def add_spawn(self):
         self.spawn_data.append({'type': self.sp_type.currentText(), 'command': self.sp_cmd.text()})
+        self.reload_spawns()
+
+    def update_spawn(self):
+        item = self.spawn_tree.currentItem()
+        if not item: return
+        idx = self.spawn_tree.indexOfTopLevelItem(item)
+        self.spawn_data[idx] = {'type': self.sp_type.currentText(), 'command': self.sp_cmd.text()}
         self.reload_spawns()
         
     def del_spawn(self):
         item = self.spawn_tree.currentItem()
         if item:
-            cmd = item.text(1)
-            self.spawn_data = [s for s in self.spawn_data if s['command'] != cmd]
+            idx = self.spawn_tree.indexOfTopLevelItem(item)
+            del self.spawn_data[idx]
             self.reload_spawns()
             
     def save_spawns(self):
@@ -800,8 +958,465 @@ class NiriWindow(QMainWindow):
     def save_env(self):
         self.handler.replace_environment_section(self.env_data)
 
-    def create_window_rules_tab(self): self.add_tab(QLabel("Rules not fully implemented in GUI yet"), "Rules")
-    def create_layer_rules_tab(self): self.add_tab(QLabel("Layers not fully implemented in GUI yet"), "Layers")
+    def create_switches_tab(self):
+        split = QSplitter(Qt.Horizontal)
+        self.switch_tree = QTreeWidget(); self.switch_tree.setHeaderLabels(["Event", "Action"])
+        split.addWidget(self.switch_tree)
+        
+        w = QWidget(); l = QFormLayout(w)
+        self.sw_evt = QComboBox(); self.sw_evt.addItems(["lid-close", "lid-open", "tablet-mode-on", "tablet-mode-off"])
+        self.sw_act = QComboBox(); self.sw_act.addItems(NIRI_ACTIONS); self.sw_act.setEditable(True)
+        l.addRow("Event", self.sw_evt)
+        l.addRow("Action", self.sw_act)
+        
+        btn = QPushButton("Add/Update"); btn.clicked.connect(self.add_switch); l.addRow(btn)
+        btn_d = QPushButton("Delete"); btn_d.clicked.connect(self.del_switch); l.addRow(btn_d)
+        
+        split.addWidget(w)
+        self.add_tab(split, "Switches")
+        self.reload_switches()
+
+    def reload_switches(self):
+        self.switch_tree.clear()
+        self.switch_data = self.handler.extract_switch_events()
+        for s in self.switch_data:
+            QTreeWidgetItem(self.switch_tree, [s['event'], s['action']])
+
+    def add_switch(self):
+        self.switch_data.append({'event': self.sw_evt.currentText(), 'action': self.sw_act.currentText()})
+        self.reload_switches()
+
+    def del_switch(self):
+        item = self.switch_tree.currentItem()
+        if item:
+            self.switch_data = [s for s in self.switch_data if s['event'] != item.text(0)]
+            self.reload_switches()
+
+    def save_switches(self):
+        self.handler.replace_switch_events(self.switch_data)
+
+    def create_gestures_tab(self):
+        w = QWidget(); l = QFormLayout(w)
+        self.create_form_row(l, "Workspace Back/Forth", "input", "workspace-auto-back-and-forth", "false", is_bool=True)
+        self.create_form_row(l, "Drag Lock", "input.touchpad", "drag-lock", "false", is_bool=True)
+        l.addRow(QLabel("<i>Note: Most gestures are configured via specific key/touchpad bindings in the Binds tab.</i>"))
+        self.add_tab(w, "Gestures")
+
+    def create_recent_windows_tab(self):
+        w = QWidget(); l = QVBoxLayout(w)
+        l.addWidget(QLabel("<b>Helper: Add Window History Binds</b>"))
+        
+        btn1 = QPushButton("Add 'Mod+[' -> focus-window-history-down")
+        btn1.clicked.connect(lambda: self.quick_add_bind("Mod+BracketLeft", "focus-window-history-down"))
+        l.addWidget(btn1)
+        
+        btn2 = QPushButton("Add 'Mod+]' -> focus-window-history-up")
+        btn2.clicked.connect(lambda: self.quick_add_bind("Mod+BracketRight", "focus-window-history-up"))
+        l.addWidget(btn2)
+        l.addStretch()
+        self.add_tab(w, "Recent")
+
+    def quick_add_bind(self, k, a):
+        # We modify the bind data directly then refresh
+        self.bind_data.append((k, a))
+        self.reload_binds_ui() # Update Binds tab UI if visible
+        QMessageBox.information(self, "Added", f"Added bind: {k} -> {a}")
+
+    def create_includes_tab(self):
+        split = QSplitter(Qt.Horizontal)
+        self.inc_tree = QTreeWidget(); self.inc_tree.setHeaderLabels(["Path"])
+        split.addWidget(self.inc_tree)
+        w = QWidget(); l = QHBoxLayout(w)
+        self.inc_path = QLineEdit()
+        btn = QPushButton("Add"); btn.clicked.connect(self.add_inc)
+        btn_d = QPushButton("Delete"); btn_d.clicked.connect(self.del_inc)
+        l.addWidget(self.inc_path); l.addWidget(btn); l.addWidget(btn_d)
+        
+        container = QWidget(); v = QVBoxLayout(container)
+        v.addWidget(split); v.addWidget(w)
+        self.add_tab(container, "Includes")
+        self.reload_includes()
+
+    def reload_includes(self):
+        self.inc_tree.clear()
+        self.inc_data = self.handler.extract_includes()
+        for i in self.inc_data: QTreeWidgetItem(self.inc_tree, [i])
+    
+    def add_inc(self):
+        if self.inc_path.text():
+            self.inc_data.append(self.inc_path.text())
+            self.reload_includes()
+            
+    def del_inc(self):
+        item = self.inc_tree.currentItem()
+        if item:
+            self.inc_data.remove(item.text(0))
+            self.reload_includes()
+            
+    def save_includes(self):
+        self.handler.replace_includes(self.inc_data)
+
+    def create_layer_rules_tab(self):
+        split = QSplitter(Qt.Horizontal)
+        self.layer_rule_tree = QTreeWidget()
+        self.layer_rule_tree.setHeaderLabels(["Rule Matcher"])
+        split.addWidget(self.layer_rule_tree)
+        
+        w = QWidget(); l = QFormLayout(w)
+        
+        gb_match = QGroupBox("Match Criteria")
+        lm = QFormLayout(gb_match)
+        self.lr_namespace = QLineEdit()
+        self.lr_id = QLineEdit()
+        lm.addRow("Namespace (Regex)", self.lr_namespace)
+        lm.addRow("ID (Regex)", self.lr_id)
+        l.addRow(gb_match)
+        
+        gb_props = QGroupBox("Properties")
+        lp = QFormLayout(gb_props)
+        self.lr_block_out = QComboBox()
+        self.lr_block_out.addItems(["", "screencast"])
+        self.lr_corner = QLineEdit()
+        self.lr_opacity = QLineEdit()
+        
+        lp.addRow("Block Out From", self.lr_block_out)
+        lp.addRow("Corner Radius", self.lr_corner)
+        lp.addRow("Opacity", self.lr_opacity)
+        l.addRow(gb_props)
+        
+        btn_update = QPushButton("Update / Add")
+        btn_update.clicked.connect(self.save_layer_rule_mem)
+        l.addRow(btn_update)
+        
+        btn_del = QPushButton("Delete Selected")
+        btn_del.clicked.connect(self.del_layer_rule)
+        l.addRow(btn_del)
+        
+        split.addWidget(w)
+        self.add_tab(split, "Layers")
+        
+        self.layer_rule_tree.itemSelectionChanged.connect(self.on_layer_rule_select)
+        self.reload_layer_rules()
+
+    def reload_layer_rules(self):
+        self.layer_rule_tree.clear()
+        self.layer_rules_data = [] 
+        
+        raw_rules = self.handler.extract_layer_rules()
+        for r in raw_rules:
+            c = r['content']
+            data = {'namespace': '', 'id': '', 'block_out': '', 'corner': '', 'opacity': ''}
+            
+            # Parsing logic
+            m_match = re.search(r'match\s+(.*)', c)
+            if m_match:
+                match_str = m_match.group(1)
+                mn = re.search(r'namespace="([^"]+)"', match_str)
+                if mn: data['namespace'] = mn.group(1)
+                mi = re.search(r'id="([^"]+)"', match_str)
+                if mi: data['id'] = mi.group(1)
+            
+            mb = re.search(r'block-out-from\s+"([^"]+)"', c)
+            if mb: data['block_out'] = mb.group(1)
+            
+            mc = re.search(r'geometry-corner-radius\s+([\d\.]+)', c)
+            if mc: data['corner'] = mc.group(1)
+            
+            mo = re.search(r'opacity\s+([\d\.]+)', c)
+            if mo: data['opacity'] = mo.group(1)
+            
+            self.layer_rules_data.append(data)
+            
+            label = "Rule"
+            if data['namespace']: label += f" ns='{data['namespace']}'"
+            if data['id']: label += f" id='{data['id']}'"
+            QTreeWidgetItem(self.layer_rule_tree, [label])
+
+    def on_layer_rule_select(self):
+        item = self.layer_rule_tree.currentItem()
+        if not item: return
+        idx = self.layer_rule_tree.indexOfTopLevelItem(item)
+        if idx < 0 or idx >= len(self.layer_rules_data): return
+        
+        d = self.layer_rules_data[idx]
+        self.lr_namespace.setText(d['namespace'])
+        self.lr_id.setText(d['id'])
+        self.lr_block_out.setCurrentText(d['block_out'])
+        self.lr_corner.setText(d['corner'])
+        self.lr_opacity.setText(d['opacity'])
+
+    def save_layer_rule_mem(self):
+        data = {
+            'namespace': self.lr_namespace.text(),
+            'id': self.lr_id.text(),
+            'block_out': self.lr_block_out.currentText(),
+            'corner': self.lr_corner.text(),
+            'opacity': self.lr_opacity.text()
+        }
+        
+        item = self.layer_rule_tree.currentItem()
+        if item:
+            idx = self.layer_rule_tree.indexOfTopLevelItem(item)
+            self.layer_rules_data[idx] = data
+        else:
+            self.layer_rules_data.append(data)
+        
+        self.refresh_layer_rules_tree_labels()
+
+    def refresh_layer_rules_tree_labels(self):
+        self.layer_rule_tree.clear()
+        for d in self.layer_rules_data:
+            label = "Rule"
+            if d['namespace']: label += f" ns='{d['namespace']}'"
+            if d['id']: label += f" id='{d['id']}'"
+            QTreeWidgetItem(self.layer_rule_tree, [label])
+
+    def del_layer_rule(self):
+        item = self.layer_rule_tree.currentItem()
+        if not item: return
+        idx = self.layer_rule_tree.indexOfTopLevelItem(item)
+        del self.layer_rules_data[idx]
+        self.refresh_layer_rules_tree_labels()
+
+    def save_layer_rules(self):
+        block = ""
+        for d in self.layer_rules_data:
+            block += "layer-rule {\n"
+            matchers = []
+            if d['namespace']: matchers.append(f'namespace="{d["namespace"]}"')
+            if d['id']: matchers.append(f'id="{d["id"]}"')
+            
+            if matchers:
+                block += f"    match {' '.join(matchers)}\n"
+            
+            if d['block_out']: block += f'    block-out-from "{d["block_out"]}"\n'
+            if d['corner']: block += f'    geometry-corner-radius {d["corner"]}\n'
+            if d['opacity']: block += f'    opacity {d["opacity"]}\n'
+            block += "}\n\n"
+        
+        self.handler.replace_layer_rules_section(block)
+
+    def create_window_rules_tab(self):
+        split = QSplitter(Qt.Horizontal)
+        self.rule_tree = QTreeWidget()
+        self.rule_tree.setHeaderLabels(["Rule Matcher"])
+        split.addWidget(self.rule_tree)
+        
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        w = QWidget()
+        scroll.setWidget(w)
+        l = QFormLayout(w)
+        
+        # Matchers
+        gb_match = QGroupBox("Match Criteria")
+        lm = QFormLayout(gb_match)
+        self.wr_app_id = QLineEdit()
+        self.wr_title = QLineEdit()
+        self.wr_is_focused = QCheckBox("Is Focused") 
+        lm.addRow("App ID (Regex)", self.wr_app_id)
+        lm.addRow("Title (Regex)", self.wr_title)
+        lm.addRow("", self.wr_is_focused)
+        l.addRow(gb_match)
+        
+        # Geometry / Appearance
+        gb_geo = QGroupBox("Geometry & Appearance")
+        lg = QFormLayout(gb_geo)
+        self.wr_opacity = QLineEdit()
+        self.wr_corner_radius = QLineEdit()
+        self.wr_clip_geo = QCheckBox("Clip to Geometry")
+        self.wr_draw_border_bg = QCheckBox("Draw Border w/ Background")
+        lg.addRow("Opacity (0.0-1.0)", self.wr_opacity)
+        lg.addRow("Corner Radius", self.wr_corner_radius)
+        lg.addRow("", self.wr_clip_geo)
+        lg.addRow("", self.wr_draw_border_bg)
+        l.addRow(gb_geo)
+
+        # Behavior
+        gb_beh = QGroupBox("Behavior")
+        lb = QFormLayout(gb_beh)
+        self.wr_open_max = QCheckBox("Open Maximized")
+        self.wr_open_full = QCheckBox("Open Fullscreen")
+        self.wr_open_float = QCheckBox("Open Floating")
+        self.wr_default_col_width = QLineEdit() # e.g. "proportion 0.5"
+        self.wr_open_output = QComboBox()
+        self.wr_open_output.setEditable(True)
+        self.wr_open_output.addItems(self.sys_outputs)
+        
+        lb.addRow("", self.wr_open_max)
+        lb.addRow("", self.wr_open_full)
+        lb.addRow("", self.wr_open_float)
+        lb.addRow("Def. Col Width", self.wr_default_col_width)
+        lb.addRow("Open on Output", self.wr_open_output)
+        l.addRow(gb_beh)
+        
+        # Misc
+        gb_misc = QGroupBox("Misc")
+        lmi = QFormLayout(gb_misc)
+        self.wr_block_out = QComboBox()
+        self.wr_block_out.addItems(["", "screencast"])
+        lmi.addRow("Block Out From", self.wr_block_out)
+        l.addRow(gb_misc)
+        
+        # Buttons
+        btn_update = QPushButton("Update / Add Rule")
+        btn_update.clicked.connect(self.save_rule_mem)
+        l.addRow(btn_update)
+        
+        btn_del = QPushButton("Delete Selected")
+        btn_del.clicked.connect(self.del_rule)
+        l.addRow(btn_del)
+        
+        split.addWidget(scroll)
+        self.add_tab(split, "Rules")
+        
+        self.rule_tree.itemSelectionChanged.connect(self.on_rule_select)
+        self.reload_rules()
+
+    def reload_rules(self):
+        self.rule_tree.clear()
+        self.rules_data = [] # Clear internal memory
+        
+        raw_rules = self.handler.extract_window_rules()
+        for r in raw_rules:
+            c = r['content']
+            data = {
+                'app_id': '', 'title': '', 'is_focused': False,
+                'opacity': '', 'corner': '', 'clip': False, 'border_bg': False,
+                'max': False, 'full': False, 'float': False, 'col_width': '', 'output': '',
+                'block_out': ''
+            }
+            
+            # Parsing (simplified regex)
+            m_app = re.search(r'app-id="([^"]+)"', c); 
+            if m_app: data['app_id'] = m_app.group(1)
+            
+            m_tit = re.search(r'title="([^"]+)"', c); 
+            if m_tit: data['title'] = m_tit.group(1)
+            
+            if "is-focused true" in c: data['is_focused'] = True
+            
+            m_op = re.search(r'opacity\s+([\d\.]+)', c); 
+            if m_op: data['opacity'] = m_op.group(1)
+            
+            m_cr = re.search(r'geometry-corner-radius\s+([\d\.]+)', c); 
+            if m_cr: data['corner'] = m_cr.group(1)
+            
+            if "clip-to-geometry true" in c: data['clip'] = True
+            if "draw-border-with-background true" in c: data['border_bg'] = True
+            if "open-maximized true" in c: data['max'] = True
+            if "open-fullscreen true" in c: data['full'] = True
+            if "open-floating true" in c: data['float'] = True
+            
+            m_cw = re.search(r'default-column-width\s+\{(.*)\}', c)
+            if m_cw: data['col_width'] = m_cw.group(1).strip()
+            
+            m_out = re.search(r'open-on-output\s+"([^"]+)"', c)
+            if m_out: data['output'] = m_out.group(1)
+            
+            m_blk = re.search(r'block-out-from\s+"([^"]+)"', c)
+            if m_blk: data['block_out'] = m_blk.group(1)
+            
+            self.rules_data.append(data)
+            
+            # Label
+            lbl = "Rule"
+            if data['app_id']: lbl += f" app='{data['app_id']}'"
+            elif data['title']: lbl += f" title='{data['title']}'"
+            QTreeWidgetItem(self.rule_tree, [lbl])
+
+    def on_rule_select(self):
+        item = self.rule_tree.currentItem()
+        if not item: return
+        idx = self.rule_tree.indexOfTopLevelItem(item)
+        if idx < 0 or idx >= len(self.rules_data): return
+        
+        d = self.rules_data[idx]
+        self.wr_app_id.setText(d['app_id'])
+        self.wr_title.setText(d['title'])
+        self.wr_is_focused.setChecked(d['is_focused'])
+        self.wr_opacity.setText(d['opacity'])
+        self.wr_corner_radius.setText(d['corner'])
+        self.wr_clip_geo.setChecked(d['clip'])
+        self.wr_draw_border_bg.setChecked(d['border_bg'])
+        self.wr_open_max.setChecked(d['max'])
+        self.wr_open_full.setChecked(d['full'])
+        self.wr_open_float.setChecked(d['float'])
+        self.wr_default_col_width.setText(d['col_width'])
+        self.wr_open_output.setCurrentText(d['output'])
+        self.wr_block_out.setCurrentText(d['block_out'])
+
+    def save_rule_mem(self):
+        data = {
+            'app_id': self.wr_app_id.text(),
+            'title': self.wr_title.text(),
+            'is_focused': self.wr_is_focused.isChecked(),
+            'opacity': self.wr_opacity.text(),
+            'corner': self.wr_corner_radius.text(),
+            'clip': self.wr_clip_geo.isChecked(),
+            'border_bg': self.wr_draw_border_bg.isChecked(),
+            'max': self.wr_open_max.isChecked(),
+            'full': self.wr_open_full.isChecked(),
+            'float': self.wr_open_float.isChecked(),
+            'col_width': self.wr_default_col_width.text(),
+            'output': self.wr_open_output.currentText(),
+            'block_out': self.wr_block_out.currentText()
+        }
+        
+        item = self.rule_tree.currentItem()
+        if item:
+            idx = self.rule_tree.indexOfTopLevelItem(item)
+            self.rules_data[idx] = data
+        else:
+            self.rules_data.append(data)
+        
+        self.refresh_rules_tree_labels()
+
+    def refresh_rules_tree_labels(self):
+        self.rule_tree.clear()
+        for d in self.rules_data:
+            lbl = "Rule"
+            if d['app_id']: lbl += f" app='{d['app_id']}'"
+            elif d['title']: lbl += f" title='{d['title']}'"
+            QTreeWidgetItem(self.rule_tree, [lbl])
+
+    def del_rule(self):
+        item = self.rule_tree.currentItem()
+        if not item: return
+        idx = self.rule_tree.indexOfTopLevelItem(item)
+        del self.rules_data[idx]
+        self.refresh_rules_tree_labels()
+
+    def save_rules(self):
+        block = ""
+        for d in self.rules_data:
+            block += "window-rule {\n"
+            
+            # Matchers
+            matchers = []
+            if d['app_id']: matchers.append(f'app-id="{d["app_id"]}"')
+            if d['title']: matchers.append(f'title="{d["title"]}"')
+            if d['is_focused']: matchers.append("is-focused=true")
+            
+            if matchers:
+                block += f"    match {' '.join(matchers)}\n"
+            
+            # Props
+            if d['opacity']: block += f"    opacity {d['opacity']}\n"
+            if d['corner']: block += f"    geometry-corner-radius {d['corner']}\n"
+            if d['clip']: block += "    clip-to-geometry true\n"
+            if d['border_bg']: block += "    draw-border-with-background true\n"
+            if d['max']: block += "    open-maximized true\n"
+            if d['full']: block += "    open-fullscreen true\n"
+            if d['float']: block += "    open-floating true\n"
+            if d['col_width']: block += f"    default-column-width {{ {d['col_width']} }}\n"
+            if d['output']: block += f'    open-on-output "{d["output"]}"\n'
+            if d['block_out']: block += f'    block-out-from "{d["block_out"]}"\n'
+            
+            block += "}\n\n"
+        
+        self.handler.replace_window_rules_section(block)
+
     def create_animations_tab(self):
         w = QWidget(); l = QFormLayout(w)
         self.create_form_row(l, "Off", "animations", "off", "false", is_bool=True)
@@ -812,10 +1427,6 @@ class NiriWindow(QMainWindow):
         self.create_form_row(l, "Overlay", "debug", "enable-overlay", "false", is_bool=True)
         self.create_form_row(l, "DRM Device", "debug", "render-drm-device", "", options=self.sys_drm)
         self.add_tab(w, "Debug")
-    def create_switches_tab(self): self.add_tab(QLabel("Switches Placeholder"), "Switches")
-    def create_gestures_tab(self): self.add_tab(QLabel("Gestures Placeholder"), "Gestures")
-    def create_recent_windows_tab(self): self.add_tab(QLabel("Recent Placeholder"), "Recent")
-    def create_includes_tab(self): self.add_tab(QLabel("Includes Placeholder"), "Includes")
 
     def create_raw_tab(self):
         self.raw_editor = CodeEditor()
@@ -869,7 +1480,10 @@ class NiriWindow(QMainWindow):
         self.save_binds()
         self.save_spawns()
         self.save_env()
-        # rules/layers/switches would go here
+        self.save_layer_rules()
+        self.save_rules()
+        self.save_switches()
+        self.save_includes()
 
         # 3. Raw override if active
         if self.tabs.currentWidget() == self.raw_editor:
@@ -895,6 +1509,10 @@ class NiriWindow(QMainWindow):
         self.reload_binds()
         self.reload_spawns()
         self.reload_env()
+        self.reload_layer_rules()
+        self.reload_rules()
+        self.reload_switches()
+        self.reload_includes()
 
 if __name__ == "__main__":
     app = QApplication(sys.argv)
