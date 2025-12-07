@@ -1,0 +1,9 @@
+[Desktop Entry]
+Name=NiCoEd
+Comment=Edit Niri Configuration
+Exec=nicoed
+Icon=utilities-terminal
+Terminal=false
+Type=Application
+Categories=Utility;Settings;
+Keywords=niri;config;editor;
